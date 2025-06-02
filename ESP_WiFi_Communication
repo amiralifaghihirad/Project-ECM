@@ -1,14 +1,19 @@
 /*
  * ESP WiFi Communication Module
- * Version: 1.1
+ * Version: 1.2 (Optimized)
  * Author: Amir Saleh
- * Description: Handles WiFi connection and data transmission using ESP module
- * Repository: [GitHub Repository URL]
+ * Description: Enhanced WiFi connection and data transmission handling
+ * Improvements:
+ * - Better AT command response handling
+ * - Improved error management
+ * - Proper connection state verification
+ * - Enhanced timeout handling
+ * - Better buffer management
  */
 
 #include <Arduino.h>
 
-// Define your network credentials
+// Network credentials
 const char* ssid = "YourSSID";
 const char* password = "YourPassword";
 
@@ -24,73 +29,158 @@ struct SensorData {
 };
 
 // Timeout settings
-const unsigned long AT_TIMEOUT = 5000; // 5 seconds timeout for AT commands
-const unsigned long WIFI_CONNECT_TIMEOUT = 30000; // 30 seconds for WiFi connection
+const unsigned long AT_TIMEOUT = 5000;        // 5 seconds for AT commands
+const unsigned long WIFI_CONNECT_TIMEOUT = 30000; // 30 seconds for WiFi
+const unsigned long TCP_CONNECT_TIMEOUT = 10000;  // 10 seconds for TCP
+const unsigned long DATA_SEND_TIMEOUT = 8000;     // 8 seconds for data send
 
-void sendATCommand(const char* cmd, const char* expectedResponse = "OK", unsigned long timeout = AT_TIMEOUT) {
+// Buffer sizes
+const int MAX_RESPONSE_LENGTH = 512;
+const int MAX_CMD_LENGTH = 128;
+const int MAX_PAYLOAD_LENGTH = 256;
+
+/**
+ * Send AT command and wait for expected response
+ * @param cmd AT command to send
+ * @param expectedResponse Expected response string
+ * @param timeout Timeout in milliseconds
+ * @return true if expected response received, false otherwise
+ */
+bool sendATCommand(const char* cmd, const char* expectedResponse = "OK", 
+                  unsigned long timeout = AT_TIMEOUT) {
   Serial.print("Sending: ");
   Serial.println(cmd);
+  
+  // Clear serial buffer
+  while(Serial1.available()) Serial1.read();
+  
   Serial1.println(cmd);
   
   unsigned long startTime = millis();
   String response = "";
+  bool responseComplete = false;
   
-  while (millis() - startTime < timeout) {
-    if (Serial1.available()) {
+  while (millis() - startTime < timeout && !responseComplete) {
+    while (Serial1.available()) {
       char c = Serial1.read();
       response += c;
       Serial.write(c); // Echo to serial monitor
       
-      // Check if expected response is found
+      // Prevent buffer overflow
+      if (response.length() > MAX_RESPONSE_LENGTH) {
+        response = response.substring(response.length() - MAX_RESPONSE_LENGTH);
+      }
+      
+      // Check for expected response
       if (response.indexOf(expectedResponse) != -1) {
-        return;
+        responseComplete = true;
+        break;
+      }
+      
+      // Check for common error responses
+      if (response.indexOf("ERROR") != -1 || 
+          response.indexOf("FAIL") != -1) {
+        Serial.println("Command failed");
+        return false;
       }
     }
   }
   
-  Serial.println("Error: Timeout waiting for response");
-}
-
-bool setupWiFi() {
-  Serial.println("Initializing ESP module...");
-  
-  // Reset module (optional)
-  // sendATCommand("AT+RST");
-  // delay(1000);
-  
-  // Check if module is responsive
-  sendATCommand("AT", "OK");
-  
-  // Set WiFi mode to station (client)
-  sendATCommand("AT+CWMODE=1", "OK");
-  
-  // Connect to WiFi network
-  char connectCmd[128];
-  snprintf(connectCmd, sizeof(connectCmd), "AT+CWJAP=\"%s\",\"%s\"", ssid, password);
-  sendATCommand(connectCmd, "OK", WIFI_CONNECT_TIMEOUT);
-  
-  // Get IP address (for debugging)
-  sendATCommand("AT+CIFSR", "OK");
+  if (!responseComplete) {
+    Serial.print("Timeout waiting for: ");
+    Serial.println(expectedResponse);
+    Serial.println("Received:");
+    Serial.println(response);
+    return false;
+  }
   
   return true;
 }
 
+/**
+ * Connect to WiFi network
+ * @return true if connected successfully, false otherwise
+ */
+bool setupWiFi() {
+  Serial.println("Initializing ESP module...");
+  
+  // Reset module (optional)
+  if (!sendATCommand("AT+RST", "ready", 5000)) {
+    Serial.println("Module reset failed");
+    return false;
+  }
+  delay(1000);
+  
+  // Check if module is responsive
+  if (!sendATCommand("AT")) {
+    Serial.println("Module not responding");
+    return false;
+  }
+  
+  // Set WiFi mode to station (client)
+  if (!sendATCommand("AT+CWMODE=1")) {
+    Serial.println("Failed to set WiFi mode");
+    return false;
+  }
+  
+  // Connect to WiFi network
+  char connectCmd[MAX_CMD_LENGTH];
+  snprintf(connectCmd, sizeof(connectCmd), "AT+CWJAP=\"%s\",\"%s\"", ssid, password);
+  
+  if (!sendATCommand(connectCmd, "OK", WIFI_CONNECT_TIMEOUT)) {
+    Serial.println("Failed to connect to WiFi");
+    return false;
+  }
+  
+  // Verify connection status
+  if (!sendATCommand("AT+CIPSTATUS", "STATUS:3", 3000)) {
+    Serial.println("WiFi connected but no IP");
+    return false;
+  }
+  
+  // Get IP address (for debugging)
+  sendATCommand("AT+CIFSR");
+  
+  return true;
+}
+
+/**
+ * Send sensor data to server
+ * @param data SensorData structure containing sensor readings
+ * @return true if data sent successfully, false otherwise
+ */
 bool sendDataToServer(const SensorData &data) {
   // Start TCP connection
-  char tcpCmd[128];
+  char tcpCmd[MAX_CMD_LENGTH];
   snprintf(tcpCmd, sizeof(tcpCmd), "AT+CIPSTART=\"TCP\",\"%s\",%d", server, port);
-  sendATCommand(tcpCmd, "OK");
+  
+  if (!sendATCommand(tcpCmd, "OK", TCP_CONNECT_TIMEOUT)) {
+    Serial.println("Failed to establish TCP connection");
+    return false;
+  }
+  
+  // Verify connection status
+  if (!sendATCommand("AT+CIPSTATUS", "STATUS:4", 3000)) {
+    Serial.println("TCP connection not properly established");
+    sendATCommand("AT+CIPCLOSE"); // Clean up
+    return false;
+  }
   
   // Prepare HTTP GET request
-  char payload[128];
+  char payload[MAX_PAYLOAD_LENGTH];
   snprintf(payload, sizeof(payload), 
            "GET /log?gas=%d&temp=%d&s3=%d HTTP/1.1\r\nHost: %s\r\n\r\n", 
            data.gas, data.temp, data.sensor3, server);
   
   // Send payload length
-  char sendCmd[32];
+  char sendCmd[MAX_CMD_LENGTH];
   snprintf(sendCmd, sizeof(sendCmd), "AT+CIPSEND=%d", strlen(payload));
-  sendATCommand(sendCmd, ">");
+  
+  if (!sendATCommand(sendCmd, ">", 2000)) {
+    Serial.println("Failed to prepare data transmission");
+    sendATCommand("AT+CIPCLOSE"); // Clean up
+    return false;
+  }
   
   // Send actual payload
   Serial1.print(payload);
@@ -98,39 +188,58 @@ bool sendDataToServer(const SensorData &data) {
   // Wait for response
   unsigned long startTime = millis();
   String response = "";
-  while (millis() - startTime < AT_TIMEOUT) {
-    if (Serial1.available()) {
+  bool sendOk = false;
+  
+  while (millis() - startTime < DATA_SEND_TIMEOUT) {
+    while (Serial1.available()) {
       char c = Serial1.read();
       response += c;
       Serial.write(c);
       
       if (response.indexOf("SEND OK") != -1) {
-        return true;
+        sendOk = true;
+        break;
+      }
+      
+      // Check for errors
+      if (response.indexOf("ERROR") != -1 || 
+          response.indexOf("FAIL") != -1) {
+        Serial.println("Error in data transmission");
+        sendATCommand("AT+CIPCLOSE"); // Clean up
+        return false;
       }
     }
+    
+    if (sendOk) break;
   }
   
-  Serial.println("Error: Data transmission failed");
-  return false;
+  // Close connection after sending
+  sendATCommand("AT+CIPCLOSE");
+  
+  if (!sendOk) {
+    Serial.println("Data transmission timeout");
+    return false;
+  }
+  
+  return true;
 }
 
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
-  Serial1.begin(115200); // Default baud rate for ESP modules
+  Serial1.begin(115200);
   
   delay(1000); // Wait for serial ports to initialize
   
   Serial.println("Starting WiFi communication...");
   
   if (!setupWiFi()) {
-    Serial.println("Failed to connect to WiFi");
+    Serial.println("Critical: Failed to initialize WiFi");
     while(1); // Halt if WiFi connection fails
   }
 }
 
 void loop() {
-  // Example usage
   static unsigned long lastSendTime = 0;
   
   if (millis() - lastSendTime > 5000) { // Send data every 5 seconds
@@ -141,7 +250,11 @@ void loop() {
     };
     
     if (!sendDataToServer(data)) {
-      Serial.println("Failed to send data to server");
+      Serial.println("Warning: Failed to send data to server");
+      // Attempt to reconnect if failed
+      if (!setupWiFi()) {
+        Serial.println("Error: WiFi reconnection failed");
+      }
     }
     
     lastSendTime = millis();
