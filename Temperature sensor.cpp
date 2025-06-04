@@ -20,8 +20,7 @@ void setup()
 
 	// Wait for Serial connection on boards like Leonardo, Zero, Due
 #if defined(ARDUINO_ARCH_SAMD) || defined(ARDUINO_AVR_LEONARDO)
-	while (!Serial)
-		;
+	while (!Serial);
 #endif
 
 	dht.begin(); // Initialize the DHT sensor
