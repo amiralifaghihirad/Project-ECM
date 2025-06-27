@@ -1,0 +1,370 @@
+/*
+ * ESP WiFi Communication Module
+ * Version: 2.0 (Fully Optimized)
+ * Author: Amir Saleh
+ * Description: Robust WiFi connection and data transmission handling with improved error recovery
+ */
+
+#include <Arduino.h>
+
+// Configuration structure for better organization
+struct NetworkConfig {
+  const char* ssid;
+  const char* password;
+  const char* server;
+  const int port;
+};
+
+// Sensor data structure
+struct SensorData {
+  int gas;
+  int temp;
+  int sensor3;
+};
+
+// Configuration constants
+const NetworkConfig NET_CONFIG = {
+  "YourSSID",
+  "YourPassword",
+  "192.168.1.100",
+  80
+};
+
+// Timeout constants
+enum TimeoutValues {
+  AT_TIMEOUT = 5000,          // 5 seconds for AT commands
+  WIFI_CONNECT_TIMEOUT = 30000, // 30 seconds for WiFi
+  TCP_CONNECT_TIMEOUT = 10000,  // 10 seconds for TCP
+  DATA_SEND_TIMEOUT = 8000,     // 8 seconds for data send
+  SERIAL_INIT_DELAY = 1000      // 1 second for serial init
+};
+
+// Buffer sizes with safety margins
+enum BufferSizes {
+  MAX_RESPONSE_LENGTH = 512,
+  MAX_CMD_LENGTH = 128,
+  MAX_PAYLOAD_LENGTH = 384,
+  SAFETY_MARGIN = 32
+};
+
+// Connection status enum
+enum ConnectionStatus {
+  STATUS_IDLE = 0,
+  STATUS_CONNECTED = 3,
+  STATUS_TCP_CONNECTED = 4,
+  STATUS_DISCONNECTED = 5
+};
+
+/**
+ * Send AT command and wait for expected response
+ * @param cmd AT command to send
+ * @param expectedResponse Expected response string
+ * @param timeout Timeout in milliseconds
+ * @return true if expected response received, false otherwise
+ */
+bool sendATCommand(const char* cmd, const char* expectedResponse = "OK", 
+                  unsigned long timeout = AT_TIMEOUT) {
+  // Validate input parameters
+  if (cmd == nullptr || strlen(cmd) == 0) {
+    Serial.println("[AT] Error: Invalid command");
+    return false;
+  }
+
+  Serial.print("[AT] Sending: ");
+  Serial.println(cmd);
+  
+  // Clear serial buffer safely
+  Serial1.flush();
+  while (Serial1.available() > 0) {
+    Serial1.read();
+  }
+  
+  // Send command
+  Serial1.println(cmd);
+  
+  unsigned long startTime = millis();
+  String response;
+  response.reserve(MAX_RESPONSE_LENGTH); // Pre-allocate memory
+  bool responseComplete = false;
+  bool errorDetected = false;
+  
+  while (millis() - startTime < timeout && !responseComplete && !errorDetected) {
+    while (Serial1.available() > 0) {
+      char c = Serial1.read();
+      response += c;
+      
+      // Echo to serial monitor for debugging
+      if (c != '\r' && c != '\n') {
+        Serial.write(c);
+      }
+      
+      // Prevent buffer overflow with safety margin
+      if (response.length() > (MAX_RESPONSE_LENGTH - SAFETY_MARGIN)) {
+        response.remove(0, response.length() - (MAX_RESPONSE_LENGTH - SAFETY_MARGIN));
+        Serial.println("[AT] Warning: Response buffer truncated");
+      }
+      
+      // Check for expected response
+      if (expectedResponse != nullptr && response.indexOf(expectedResponse) != -1) {
+        responseComplete = true;
+        break;
+      }
+      
+      // Check for error responses
+      if (response.indexOf("ERROR") != -1 || 
+          response.indexOf("FAIL") != -1 ||
+          response.indexOf("busy") != -1) {
+        errorDetected = true;
+        break;
+      }
+    }
+    
+    // Small delay to prevent busy waiting
+    delay(10);
+  }
+  
+  if (errorDetected) {
+    Serial.println("[AT] Command failed");
+    return false;
+  }
+  
+  if (!responseComplete) {
+    Serial.print("[AT] Timeout waiting for: ");
+    Serial.println(expectedResponse ? expectedResponse : "any response");
+    Serial.print("Partial response: ");
+    Serial.println(response);
+    return false;
+  }
+  
+  return true;
+}
+
+/**
+ * Connect to WiFi network with retry mechanism
+ * @param maxRetries Maximum number of connection attempts
+ * @return true if connected successfully, false otherwise
+ */
+bool setupWiFi(int maxRetries = 3) {
+  Serial.println("Initializing ESP module...");
+  
+  // Reset module with retries
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    Serial.print("Attempt ");
+    Serial.print(attempt);
+    Serial.println(" to initialize module...");
+    
+    if (sendATCommand("AT+RST", "ready", AT_TIMEOUT)) {
+      break;
+    }
+    
+    if (attempt == maxRetries) {
+      Serial.println("Failed to reset module");
+      return false;
+    }
+    
+    delay(1000 * attempt); // Exponential backoff
+  }
+  
+  // Check module responsiveness
+  if (!sendATCommand("AT", "OK", 2000)) {
+    Serial.println("Module not responding to AT commands");
+    return false;
+  }
+  
+  // Set WiFi mode to station (client)
+  if (!sendATCommand("AT+CWMODE=1") || 
+      !sendATCommand("AT+CWMODE?", "+CWMODE:1")) {
+    Serial.println("Failed to set WiFi mode");
+    return false;
+  }
+  
+  // Build connect command safely
+  char connectCmd[MAX_CMD_LENGTH];
+  int cmdLen = snprintf(connectCmd, sizeof(connectCmd), 
+                       "AT+CWJAP=\"%s\",\"%s\"", 
+                       NET_CONFIG.ssid, 
+                       NET_CONFIG.password);
+  
+  if (cmdLen >= sizeof(connectCmd)) {
+    Serial.println("WiFi connect command too long");
+    return false;
+  }
+  
+  // Connect to WiFi with retries
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    Serial.print("WiFi connection attempt ");
+    Serial.println(attempt);
+    
+    if (sendATCommand(connectCmd, "OK", WIFI_CONNECT_TIMEOUT)) {
+      break;
+    }
+    
+    if (attempt == maxRetries) {
+      Serial.println("Failed to connect to WiFi");
+      return false;
+    }
+    
+    delay(5000 * attempt); // Exponential backoff
+  }
+  
+  // Verify connection status
+  if (!sendATCommand("AT+CIPSTATUS", "STATUS:3", 3000)) {
+    Serial.println("WiFi connected but no IP address");
+    return false;
+  }
+  
+  // Get and display IP address
+  if (!sendATCommand("AT+CIFSR")) {
+    Serial.println("Failed to get IP address");
+  }
+  
+  return true;
+}
+
+/**
+ * Send sensor data to server with proper connection management
+ * @param data SensorData structure containing readings
+ * @param maxRetries Maximum number of send attempts
+ * @return true if data sent successfully, false otherwise
+ */
+bool sendDataToServer(const SensorData &data, int maxRetries = 2) {
+  // Build TCP connection command safely
+  char tcpCmd[MAX_CMD_LENGTH];
+  int cmdLen = snprintf(tcpCmd, sizeof(tcpCmd),
+                       "AT+CIPSTART=\"TCP\",\"%s\",%d",
+                       NET_CONFIG.server,
+                       NET_CONFIG.port);
+  
+  if (cmdLen >= sizeof(tcpCmd)) {
+    Serial.println("TCP connection command too long");
+    return false;
+  }
+  
+  // Establish TCP connection with retries
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    Serial.print("TCP connection attempt ");
+    Serial.println(attempt);
+    
+    if (sendATCommand(tcpCmd, "OK", TCP_CONNECT_TIMEOUT) &&
+        sendATCommand("AT+CIPSTATUS", "STATUS:4", 3000)) {
+      break;
+    }
+    
+    if (attempt == maxRetries) {
+      Serial.println("Failed to establish TCP connection");
+      return false;
+    }
+    
+    delay(2000 * attempt); // Exponential backoff
+  }
+  
+  // Build HTTP request safely
+  char payload[MAX_PAYLOAD_LENGTH];
+  int payloadLen = snprintf(payload, sizeof(payload),
+                           "GET /log?gas=%d&temp=%d&s3=%d HTTP/1.1\r\n"
+                           "Host: %s\r\n"
+                           "Connection: close\r\n\r\n",
+                           data.gas, data.temp, data.sensor3,
+                           NET_CONFIG.server);
+  
+  if (payloadLen >= sizeof(payload)) {
+    Serial.println("HTTP payload too large");
+    sendATCommand("AT+CIPCLOSE");
+    return false;
+  }
+  
+  // Send data with proper error handling
+  bool sendSuccess = false;
+  char sendCmd[MAX_CMD_LENGTH];
+  cmdLen = snprintf(sendCmd, sizeof(sendCmd), "AT+CIPSEND=%d", payloadLen);
+  
+  if (cmdLen >= sizeof(sendCmd)) {
+    Serial.println("Send command too long");
+    sendATCommand("AT+CIPCLOSE");
+    return false;
+  }
+  
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    Serial.print("Data send attempt ");
+    Serial.println(attempt);
+    
+    if (sendATCommand(sendCmd, ">", 2000)) {
+      Serial1.print(payload);
+      
+      if (sendATCommand("", "SEND OK", DATA_SEND_TIMEOUT)) {
+        sendSuccess = true;
+        break;
+      }
+    }
+    
+    if (attempt == maxRetries) {
+      Serial.println("Failed to send data");
+    }
+    
+    delay(1000 * attempt); // Exponential backoff
+  }
+  
+  // Always close connection
+  if (!sendATCommand("AT+CIPCLOSE")) {
+    Serial.println("Warning: Failed to close TCP connection");
+  }
+  
+  return sendSuccess;
+}
+
+void setup() {
+  // Initialize serial communications
+  Serial.begin(115200);
+  Serial1.begin(115200);
+  
+  // Wait for serial ports to initialize
+  delay(SERIAL_INIT_DELAY);
+  
+  Serial.println("Starting WiFi communication...");
+  
+  // Initialize WiFi with recovery attempts
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    if (setupWiFi()) {
+      break;
+    }
+    
+    if (attempt == 3) {
+      Serial.println("Critical: Failed to initialize WiFi after multiple attempts");
+      Serial.println("Entering recovery mode - will retry in 60 seconds");
+      delay(60000);
+      ESP.restart(); // Soft reset instead of hanging
+    }
+    
+    delay(5000 * attempt); // Exponential backoff
+  }
+}
+
+void loop() {
+  static unsigned long lastSendTime = 0;
+  const unsigned long sendInterval = 5000; // 5 seconds
+  
+  if (millis() - lastSendTime >= sendInterval) {
+    // Read sensor data
+    SensorData data = {
+      analogRead(A0),
+      analogRead(A1),
+      analogRead(A2)
+    };
+    
+    // Send data with automatic recovery
+    if (!sendDataToServer(data)) {
+      Serial.println("Warning: Data transmission failed - attempting WiFi recovery");
+      
+      if (!setupWiFi()) {
+        Serial.println("Error: WiFi recovery failed - restarting");
+        delay(1000);
+        ESP.restart();
+      }
+    }
+    
+    lastSendTime = millis();
+  }
+  
+  // Small delay to prevent busy waiting
+  delay(100);
+}
