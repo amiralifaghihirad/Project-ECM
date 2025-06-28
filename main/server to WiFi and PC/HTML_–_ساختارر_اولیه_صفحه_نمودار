@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="fa">
+<head>
+  <!-- Set the character encoding to UTF-8 -->
+  <meta charset="UTF-8">
+
+  <!-- Set the page title -->
+  <title>Live Chart</title>
+
+  <!-- Include Chart.js library from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <!-- Create a canvas element for the chart -->
+  <canvas id="myChart"></canvas>
+
+  <!-- Include the external JavaScript file -->
+  <script src="app.js"></script>
+</body>
+</html>
